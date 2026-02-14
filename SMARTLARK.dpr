@@ -22,13 +22,14 @@ uses
   uLZ77Compressor in 'src\Compression\uLZ77Compressor.pas',
   uCRC32 in 'src\Utils\uCRC32.pas',
   uStreamHelpers in 'src\Utils\uStreamHelpers.pas',
+  uOperationStats in 'src\uOperationStats.pas',
   uCommandLine in 'src\uCommandLine.pas',
   uConsoleOutput in 'src\uConsoleOutput.pas',
   uArchiveIntegrationTest in 'src\uArchiveIntegrationTest.pas';
 
 procedure ShowUsage;
 begin
-  WriteLn('SMARTLARK v2.0 - Console Archiver');
+  WriteLn('SMARTLARK v2.2 - Console Archiver');
   WriteLn('');
   WriteLn('Usage: SMARTLARK [command] [archive] [files] [options]');
   WriteLn('');

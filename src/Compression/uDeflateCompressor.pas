@@ -3,7 +3,7 @@ unit uDeflateCompressor;
 interface
 
 uses
-  System.SysUtils, System.Classes, System.ZLib;
+  System.SysUtils, System.Classes, System.ZLib, uSMARTLARKExceptions;
 
 type
   // DEFLATE compressor using zlib library
@@ -73,7 +73,7 @@ begin
     end;
   except
     on E: Exception do
-      raise Exception.Create('DEFLATE compression failed: ' + E.Message);
+      raise ESMARTLARKCompressionException.Create('DEFLATE compression failed: ' + E.Message);
   end;
 end;
 
@@ -97,7 +97,7 @@ begin
     end;
   except
     on E: Exception do
-      raise Exception.Create('DEFLATE decompression failed: ' + E.Message);
+      raise ESMARTLARKCompressionException.Create('DEFLATE decompression failed: ' + E.Message);
   end;
 end;
 

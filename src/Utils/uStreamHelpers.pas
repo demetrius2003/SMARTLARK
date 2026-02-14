@@ -7,6 +7,8 @@ uses
 
 type
   TStreamHelper = class
+  private
+    class procedure ReadExact(Stream: TStream; var Buffer; Count: Integer; const Context: string);
   public
     // Write operations
     class procedure WriteByte(Stream: TStream; Value: Byte);
@@ -90,6 +92,28 @@ type
 
     property Stream: TStream read FStream;
     function GetPosition: Int64;
+  end;
+
+  // Stream wrapper that enforces a maximum size on writes
+  TBoundedStream = class(TStream)
+  private
+    FBaseStream: TStream;
+    FMaxSize: Int64;
+    FOwnsStream: Boolean;
+  protected
+    function GetSize: Int64; override;
+  public
+    constructor Create(BaseStream: TStream; MaxSize: Int64; OwnsStream: Boolean = False);
+    destructor Destroy; override;
+
+    function Read(var Buffer; Count: Longint): Longint; override;
+    function Write(const Buffer; Count: Longint): Longint; override;
+    function Seek(const Offset: Int64; Origin: TSeekOrigin): Int64; override;
+    procedure SetSize(NewSize: Longint); override;
+    procedure SetSize(const NewSize: Int64); override;
+
+    property BaseStream: TStream read FBaseStream;
+    property MaxSize: Int64 read FMaxSize;
   end;
 
 implementation
@@ -263,24 +287,45 @@ begin
     Stream.Write(Data[0], Length(Data));
 end;
 
+class procedure TStreamHelper.ReadExact(Stream: TStream; var Buffer; Count: Integer; const Context: string);
+var
+  BytesRead: Integer;
+  StartPos: Int64;
+begin
+  if Count < 0 then
+    raise ESMARTLARKFormatException.CreateFmt(
+      'Invalid read size: %d for %s. The archive may be corrupted.',
+      ecInvalidSizes, [Count, Context]);
+
+  if Count = 0 then
+    Exit;
+
+  StartPos := Stream.Position;
+  BytesRead := Stream.Read(Buffer, Count);
+  if BytesRead <> Count then
+    raise ESMARTLARKFormatException.CreateFmt(
+      'Unexpected end of stream while reading %s at position %d (expected %d bytes, got %d). The archive may be corrupted.',
+      ecArchiveTooSmall, [Context, StartPos, Count, BytesRead]);
+end;
+
 class function TStreamHelper.ReadByte(Stream: TStream): Byte;
 begin
-  Stream.Read(Result, SizeOf(Byte));
+  ReadExact(Stream, Result, SizeOf(Byte), 'byte');
 end;
 
 class function TStreamHelper.ReadWord(Stream: TStream): WORD;
 begin
-  Stream.Read(Result, SizeOf(WORD));
+  ReadExact(Stream, Result, SizeOf(WORD), 'word');
 end;
 
 class function TStreamHelper.ReadDWord(Stream: TStream): DWORD;
 begin
-  Stream.Read(Result, SizeOf(DWORD));
+  ReadExact(Stream, Result, SizeOf(DWORD), 'dword');
 end;
 
 class function TStreamHelper.ReadInt64(Stream: TStream): Int64;
 begin
-  Stream.Read(Result, SizeOf(Int64));
+  ReadExact(Stream, Result, SizeOf(Int64), 'int64');
 end;
 
 class function TStreamHelper.ReadString(Stream: TStream; Length: WORD): string;
@@ -321,9 +366,14 @@ end;
 
 class function TStreamHelper.ReadBytes(Stream: TStream; Count: Integer): TBytes;
 begin
+  if Count < 0 then
+    raise ESMARTLARKFormatException.CreateFmt(
+      'Invalid byte count: %d. The archive may be corrupted.',
+      ecInvalidSizes, [Count]);
+
   SetLength(Result, Count);
   if Count > 0 then
-    Stream.Read(Result[0], Count);
+    ReadExact(Stream, Result[0], Count, 'byte array');
 end;
 
 class procedure TStreamHelper.Align(Stream: TStream; Alignment: Integer);
@@ -360,6 +410,14 @@ var
   BytesRead: Integer;
   RemainingBytes: Int64;
 begin
+  if Count < 0 then
+    raise ESMARTLARKFormatException.CreateFmt(
+      'Invalid byte count: %d. The archive may be corrupted.',
+      ecInvalidSizes, [Count]);
+
+  if Count = 0 then
+    Exit;
+
   SetLength(Buffer, BUFFER_SIZE);
   RemainingBytes := Count;
 
@@ -371,7 +429,9 @@ begin
       BytesRead := Source.Read(Buffer[0], RemainingBytes);
 
     if BytesRead <= 0 then
-      Break;
+      raise ESMARTLARKFormatException.CreateFmt(
+        'Unexpected end of stream while copying bytes (need %d more bytes). The archive may be corrupted.',
+        ecArchiveTooSmall, [RemainingBytes]);
 
     Dest.Write(Buffer[0], BytesRead);
     Dec(RemainingBytes, BytesRead);
@@ -465,6 +525,70 @@ end;
 function TBitStream.GetPosition: Int64;
 begin
   Result := FStream.Position;
+end;
+
+{ TBoundedStream }
+
+constructor TBoundedStream.Create(BaseStream: TStream; MaxSize: Int64; OwnsStream: Boolean = False);
+begin
+  inherited Create;
+  FBaseStream := BaseStream;
+  FMaxSize := MaxSize;
+  FOwnsStream := OwnsStream;
+end;
+
+destructor TBoundedStream.Destroy;
+begin
+  if FOwnsStream then
+    FBaseStream.Free;
+  inherited;
+end;
+
+function TBoundedStream.GetSize: Int64;
+begin
+  Result := FBaseStream.Size;
+end;
+
+function TBoundedStream.Read(var Buffer; Count: Longint): Longint;
+begin
+  Result := FBaseStream.Read(Buffer, Count);
+end;
+
+function TBoundedStream.Write(const Buffer; Count: Longint): Longint;
+var
+  NewSize: Int64;
+begin
+  if Count < 0 then
+    raise ESMARTLARKFormatException.CreateFmt(
+      'Invalid write size: %d. The archive may be corrupted.',
+      ecInvalidSizes, [Count]);
+
+  NewSize := FBaseStream.Position + Count;
+  if (FMaxSize >= 0) and (NewSize > FMaxSize) then
+    raise ESMARTLARKFormatException.CreateFmt(
+      'Decompressed data exceeds expected size (%d bytes). The archive may be corrupted.',
+      ecInvalidSizes, [FMaxSize]);
+
+  Result := FBaseStream.Write(Buffer, Count);
+end;
+
+function TBoundedStream.Seek(const Offset: Int64; Origin: TSeekOrigin): Int64;
+begin
+  Result := FBaseStream.Seek(Offset, Origin);
+end;
+
+procedure TBoundedStream.SetSize(NewSize: Longint);
+begin
+  SetSize(Int64(NewSize));
+end;
+
+procedure TBoundedStream.SetSize(const NewSize: Int64);
+begin
+  if (FMaxSize >= 0) and (NewSize > FMaxSize) then
+    raise ESMARTLARKFormatException.CreateFmt(
+      'Decompressed data exceeds expected size (%d bytes). The archive may be corrupted.',
+      ecInvalidSizes, [FMaxSize]);
+  FBaseStream.Size := NewSize;
 end;
 
 end.

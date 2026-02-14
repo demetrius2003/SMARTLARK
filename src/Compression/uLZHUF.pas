@@ -32,7 +32,7 @@ unit uLZHUF;
 interface
 
 uses
-  System.SysUtils, System.Classes, System.Math, uHuffmanCoding, uStreamHelpers;
+  System.SysUtils, System.Classes, System.Math, uHuffmanCoding, uStreamHelpers, uSMARTLARKExceptions;
 
 const
   /// <summary>Maximum block size for processing (64 KB).</summary>
@@ -48,8 +48,11 @@ const
   /// <remarks>Smaller than pure LZSS (258) to optimize bit encoding.</remarks>
   LZSS_MAX_MATCH = 18;
   
-  /// <summary>Maximum number of positions to search in hash chain (512).</summary>
-  LZSS_SEARCH_LIMIT = 512;
+  /// <summary>Hash table size for 3-byte sequences (power of two).</summary>
+  LZSS_HASH_SIZE = 4096;
+  
+  /// <summary>Maximum number of candidates to check per position.</summary>
+  LZSS_MAX_CHAIN = 128;
 
 type
   /// <summary>
@@ -170,14 +173,102 @@ var
   I, J: Integer;
   B: Byte;
   MaxLen, MatchLen: Integer;
-  SearchLimit: Integer;
   Distance: Integer;
   WindowSearchPos: Integer;
+  HashHead: TArray<Integer>;
+  HashNext: TArray<Integer>;
+  HashPrev: TArray<Integer>;
+  HashSlotHash: TArray<Integer>;
+  WindowAbsPos: TArray<Integer>;
+  AbsolutePos: Integer;
+  ChainPos: Integer;
+  ChainCount: Integer;
+  Hash: Integer;
+
+  function HashBytes(B0, B1, B2: Byte): Integer;
+  begin
+    Result := ((Integer(B0) shl 4) xor (Integer(B1) shl 2) xor Integer(B2)) and (LZSS_HASH_SIZE - 1);
+  end;
+
+  procedure RemoveFromHashChain(Pos: Integer);
+  var
+    H: Integer;
+    PrevPos: Integer;
+    NextPos: Integer;
+  begin
+    H := HashSlotHash[Pos];
+    if H < 0 then
+      Exit;
+
+    PrevPos := HashPrev[Pos];
+    NextPos := HashNext[Pos];
+
+    if PrevPos <> -1 then
+      HashNext[PrevPos] := NextPos
+    else
+      HashHead[H] := NextPos;
+
+    if NextPos <> -1 then
+      HashPrev[NextPos] := PrevPos;
+
+    HashPrev[Pos] := -1;
+    HashNext[Pos] := -1;
+    HashSlotHash[Pos] := -1;
+  end;
+
+  procedure AddByteToWindow(Value: Byte);
+  var
+    StartPos: Integer;
+    H: Integer;
+  begin
+    Window[WindowPos] := Value;
+    WindowAbsPos[WindowPos] := AbsolutePos;
+
+    if WindowFilled >= LZSS_MIN_MATCH - 1 then
+    begin
+      StartPos := (WindowPos - (LZSS_MIN_MATCH - 1) + LZSS_WINDOW_SIZE) mod LZSS_WINDOW_SIZE;
+      H := HashBytes(
+        Window[StartPos],
+        Window[(StartPos + 1) mod LZSS_WINDOW_SIZE],
+        Window[(StartPos + 2) mod LZSS_WINDOW_SIZE]
+      );
+
+      RemoveFromHashChain(StartPos);
+
+      HashPrev[StartPos] := -1;
+      HashNext[StartPos] := HashHead[H];
+      if HashHead[H] <> -1 then
+        HashPrev[HashHead[H]] := StartPos;
+      HashHead[H] := StartPos;
+      HashSlotHash[StartPos] := H;
+    end;
+
+    WindowPos := (WindowPos + 1) mod LZSS_WINDOW_SIZE;
+    if WindowFilled < LZSS_WINDOW_SIZE then
+      Inc(WindowFilled);
+    Inc(AbsolutePos);
+  end;
 begin
   SetLength(InputBuffer, LZHUF_MAX_BLOCK_SIZE);
   SetLength(Window, LZSS_WINDOW_SIZE);
+  SetLength(HashHead, LZSS_HASH_SIZE);
+  SetLength(HashNext, LZSS_WINDOW_SIZE);
+  SetLength(HashPrev, LZSS_WINDOW_SIZE);
+  SetLength(HashSlotHash, LZSS_WINDOW_SIZE);
+  SetLength(WindowAbsPos, LZSS_WINDOW_SIZE);
   WindowPos := 0;
   WindowFilled := 0;
+  AbsolutePos := 0;
+
+  for I := 0 to High(HashHead) do
+    HashHead[I] := -1;
+  for I := 0 to High(HashNext) do
+  begin
+    HashNext[I] := -1;
+    HashPrev[I] := -1;
+    HashSlotHash[I] := -1;
+    WindowAbsPos[I] := -1;
+  end;
   
   BitWriter := TBitWriter.Create(Output);
 
@@ -193,43 +284,48 @@ begin
         Match.Position := 0;
         Match.Length := 0;
 
-        if InputPos + LZSS_MIN_MATCH <= BytesRead then
+        if (InputPos + LZSS_MIN_MATCH <= BytesRead) and (WindowFilled >= LZSS_MIN_MATCH) then
         begin
           MaxLen := Min(LZSS_MAX_MATCH, BytesRead - InputPos);
-          
-          // Ограничить поиск для производительности
-          // Ищем максимум LZSS_SEARCH_LIMIT последних байтов
-          SearchLimit := Min(WindowFilled, LZSS_SEARCH_LIMIT);
-          
-          // Искать совпадения в последних SearchLimit байтах окна
-          for I := 1 to SearchLimit do
-          begin
-            // Distance - это расстояние назад от текущей позиции
-            Distance := I;
-            
-            // Вычислить начальную позицию в циклическом окне
-            WindowSearchPos := (WindowPos - Distance + LZSS_WINDOW_SIZE) mod LZSS_WINDOW_SIZE;
-            
-            // Подсчитать длину совпадения
-            MatchLen := 0;
-            while (MatchLen < MaxLen) and 
-                  (InputPos + MatchLen < BytesRead) do
-            begin
-              if Window[(WindowSearchPos + MatchLen) mod LZSS_WINDOW_SIZE] = InputBuffer[InputPos + MatchLen] then
-                Inc(MatchLen)
-              else
-                Break;
-            end;
 
-            // Сохранить лучшее совпадение
-            if MatchLen >= LZSS_MIN_MATCH then
+          Hash := HashBytes(
+            InputBuffer[InputPos],
+            InputBuffer[InputPos + 1],
+            InputBuffer[InputPos + 2]
+          );
+
+          ChainPos := HashHead[Hash];
+          ChainCount := 0;
+          while (ChainPos <> -1) and (ChainCount < LZSS_MAX_CHAIN) do
+          begin
+            Distance := AbsolutePos - WindowAbsPos[ChainPos];
+            if (Distance > 0) and (Distance <= WindowFilled) and (Distance < LZSS_WINDOW_SIZE) then
             begin
-              if MatchLen > Match.Length then
+              WindowSearchPos := ChainPos;
+
+              MatchLen := 0;
+              while (MatchLen < MaxLen) and (InputPos + MatchLen < BytesRead) do
               begin
-                Match.Length := MatchLen;
-                Match.Position := Distance;
+                if Window[(WindowSearchPos + MatchLen) mod LZSS_WINDOW_SIZE] = InputBuffer[InputPos + MatchLen] then
+                  Inc(MatchLen)
+                else
+                  Break;
+              end;
+
+              if MatchLen >= LZSS_MIN_MATCH then
+              begin
+                if MatchLen > Match.Length then
+                begin
+                  Match.Length := MatchLen;
+                  Match.Position := Distance;
+                  if MatchLen = MaxLen then
+                    Break;
+                end;
               end;
             end;
+
+            ChainPos := HashNext[ChainPos];
+            Inc(ChainCount);
           end;
         end;
 
@@ -247,12 +343,7 @@ begin
 
           // Добавить все байты совпадения в окно
           for J := 0 to Match.Length - 1 do
-          begin
-            Window[WindowPos] := InputBuffer[InputPos + J];
-            WindowPos := (WindowPos + 1) mod LZSS_WINDOW_SIZE;
-            if WindowFilled < LZSS_WINDOW_SIZE then
-              Inc(WindowFilled);
-          end;
+            AddByteToWindow(InputBuffer[InputPos + J]);
 
           Inc(InputPos, Match.Length);
         end
@@ -264,10 +355,7 @@ begin
           BitWriter.WriteBits(Code.Code, Code.Length);
 
           // Добавить в окно
-          Window[WindowPos] := B;
-          WindowPos := (WindowPos + 1) mod LZSS_WINDOW_SIZE;
-          if WindowFilled < LZSS_WINDOW_SIZE then
-            Inc(WindowFilled);
+          AddByteToWindow(B);
 
           Inc(InputPos);
         end;
@@ -288,6 +376,11 @@ begin
     BitWriter.Free;
     SetLength(InputBuffer, 0);
     SetLength(Window, 0);
+    SetLength(HashHead, 0);
+    SetLength(HashNext, 0);
+    SetLength(HashPrev, 0);
+    SetLength(HashSlotHash, 0);
+    SetLength(WindowAbsPos, 0);
   end;
 end;
 
@@ -389,7 +482,7 @@ begin
       OnProgress(Self);
   except
     on E: Exception do
-      raise Exception.Create('LZHUF Compression failed: ' + E.Message);
+      raise ESMARTLARKCompressionException.Create('LZHUF Compression failed: ' + E.Message);
   end;
 end;
 
@@ -404,7 +497,7 @@ begin
       OnProgress(Self);
   except
     on E: Exception do
-      raise Exception.Create('LZHUF Decompression failed: ' + E.Message);
+      raise ESMARTLARKCompressionException.Create('LZHUF Decompression failed: ' + E.Message);
   end;
 end;
 

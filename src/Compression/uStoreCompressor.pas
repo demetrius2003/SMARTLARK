@@ -3,7 +3,7 @@ unit uStoreCompressor;
 interface
 
 uses
-  System.SysUtils, System.Classes;
+  System.SysUtils, System.Classes, uSMARTLARKExceptions;
 
 type
   // Store compressor - no compression, just copy data
@@ -57,7 +57,7 @@ begin
     end;
   except
     on E: Exception do
-      raise Exception.Create('Store compression failed: ' + E.Message);
+      raise ESMARTLARKCompressionException.Create('Store compression failed: ' + E.Message);
   end;
 end;
 
@@ -84,7 +84,7 @@ begin
     end;
   except
     on E: Exception do
-      raise Exception.Create('Store decompression failed: ' + E.Message);
+      raise ESMARTLARKCompressionException.Create('Store decompression failed: ' + E.Message);
   end;
 end;
 

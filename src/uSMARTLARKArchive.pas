@@ -3,7 +3,7 @@
 interface
 
 uses
-  System.SysUtils, System.Classes, System.Generics.Collections,
+  System.SysUtils, System.Classes, System.Generics.Collections, System.IOUtils,
   uSMARTLARKTypes, uSMARTLARKExceptions, uLZHUF, uCRC32, uStreamHelpers, uStoreCompressor, uDeflateCompressor, uLZSSCompressor, uLZWCompressor, uLZ77Compressor;
 
 type
@@ -53,6 +53,7 @@ type
     procedure WriteCentralDirectory(Stream: TStream);
     procedure CalculateStatistics;
     procedure ValidateArchive;
+    procedure DecompressFileEntryToStream(Entry: TArchiveFileEntry; CompressedData: TMemoryStream; OutputStream: TStream);
     function DecompressFileEntry(Entry: TArchiveFileEntry; CompressedData: TMemoryStream): TMemoryStream;
   public
     /// <summary>
@@ -923,9 +924,11 @@ procedure TSMARTLARKArchive.ExtractFile(const ArchivePath, DestinationPath: stri
 var
   Entry: TArchiveFileEntry;
   ArchiveStream: TFileStream;
-  CompressedData, ExtractedData: TMemoryStream;
+  CompressedData: TMemoryStream;
+  TempStream: TFileStream;
   CRC: TCRC32;
   ComputedCRC: DWORD;
+  TempFileName: string;
 begin
   Entry := GetFileInfo(ArchivePath);
   if Entry = nil then
@@ -934,39 +937,66 @@ begin
 
   ArchiveStream := TFileStream.Create(FFileName, fmOpenRead);
   CompressedData := TMemoryStream.Create;
-  ExtractedData := nil;
+  TempFileName := TPath.Combine(TPath.GetTempPath, TPath.GetRandomFileName);
 
   try
     // Read compressed data from archive
     ArchiveStream.Position := Entry.FileOffset;
     TStreamHelper.CopyBytes(ArchiveStream, CompressedData, Entry.CompressedSize);
 
-    // Decompress using common method
-    ExtractedData := DecompressFileEntry(Entry, CompressedData);
-
-    // Verify CRC
-    ExtractedData.Position := 0;
-    CRC := TCRC32.Create;
+    // Decompress to temporary file with size enforcement
+    TempStream := TFileStream.Create(TempFileName, fmCreate);
     try
-      CRC.Update(ExtractedData, ExtractedData.Size);
-      ComputedCRC := CRC.GetDigest;
+      DecompressFileEntryToStream(Entry, CompressedData, TempStream);
+
+      // Validate decompressed size
+      if TempStream.Size <> Entry.OriginalSize then
+        raise ESMARTLARKFormatException.CreateFmt(
+          'Decompressed size mismatch for file: %s (expected %d bytes, got %d). The archive may be corrupted.',
+          ecInvalidSizes, [ArchivePath, Entry.OriginalSize, TempStream.Size]);
+
+      // Verify CRC
+      TempStream.Position := 0;
+      CRC := TCRC32.Create;
+      try
+        CRC.Update(TempStream, TempStream.Size);
+        ComputedCRC := CRC.GetDigest;
+      finally
+        CRC.Free;
+      end;
+
+      if ComputedCRC <> Entry.CRC32 then
+        raise ESMARTLARKFormatException.CreateFmt('CRC mismatch for file: %s (expected %08X, got %08X). The file may be corrupted.',
+          ecCRC32Mismatch, [ArchivePath, Entry.CRC32, ComputedCRC]);
     finally
-      CRC.Free;
+      TempStream.Free;
     end;
 
-    // Write to destination FIRST, even if CRC doesn't match
-    // This allows us to compare the extracted file with the original
-    ExtractedData.SaveToFile(DestinationPath);
-    
-    // Then check CRC and report but don't fail (for debugging)
-    if ComputedCRC <> Entry.CRC32 then
-      raise ESMARTLARKFormatException.CreateFmt('CRC mismatch for file: %s (expected %08X, got %08X). The file may be corrupted.', 
-        ecCRC32Mismatch, [ArchivePath, Entry.CRC32, ComputedCRC]);
+    // Replace destination only after CRC passes
+    try
+      if System.SysUtils.FileExists(DestinationPath) then
+      begin
+        if not System.SysUtils.DeleteFile(DestinationPath) then
+          raise ESMARTLARKIOException.CreateFmt(
+            'Cannot overwrite existing file: %s. It may be locked by another process.',
+            ecArchiveNotFound, [DestinationPath]);
+      end;
+
+      if not System.SysUtils.RenameFile(TempFileName, DestinationPath) then
+        raise ESMARTLARKIOException.CreateFmt(
+          'Cannot move temporary file to destination: %s. The file may be in use.',
+          ecArchiveNotFound, [DestinationPath]);
+    except
+      if System.SysUtils.FileExists(TempFileName) then
+        System.SysUtils.DeleteFile(TempFileName);
+      raise;
+    end;
 
   finally
     ArchiveStream.Free;
     CompressedData.Free;
-    ExtractedData.Free;
+    if System.SysUtils.FileExists(TempFileName) then
+      System.SysUtils.DeleteFile(TempFileName);
   end;
 end;
 
@@ -1117,17 +1147,18 @@ procedure TSMARTLARKArchive.TestIntegrity;
 var
   Entry: TArchiveFileEntry;
   ArchiveStream: TFileStream;
-  CompressedData, ExtractedData: TMemoryStream;
+  CompressedData: TMemoryStream;
+  TempStream: TFileStream;
   CRC: TCRC32;
   ComputedCRC: DWORD;
   I: Integer;
+  TempFileName: string;
 begin
   WriteLn('Testing archive integrity...');
   WriteLn('');
 
   ArchiveStream := TFileStream.Create(FFileName, fmOpenRead);
   CompressedData := TMemoryStream.Create;
-  ExtractedData := nil;
 
   try
     for I := 0 to FFileEntries.Count - 1 do
@@ -1141,32 +1172,41 @@ begin
         ArchiveStream.Position := Entry.FileOffset;
         TStreamHelper.CopyBytes(ArchiveStream, CompressedData, Entry.CompressedSize);
 
-        // Decompress using common method
-        ExtractedData := DecompressFileEntry(Entry, CompressedData);
-
-        // Check CRC
-        ExtractedData.Position := 0;
-        CRC := TCRC32.Create;
+        TempFileName := TPath.Combine(TPath.GetTempPath, TPath.GetRandomFileName);
+        TempStream := TFileStream.Create(TempFileName, fmCreate);
         try
-          CRC.Update(ExtractedData, ExtractedData.Size);
-          ComputedCRC := CRC.GetDigest;
+          // Decompress to temporary file with size enforcement
+          DecompressFileEntryToStream(Entry, CompressedData, TempStream);
+
+          if TempStream.Size <> Entry.OriginalSize then
+            raise ESMARTLARKFormatException.CreateFmt(
+              'Decompressed size mismatch for file: %s (expected %d bytes, got %d). The archive may be corrupted.',
+              ecInvalidSizes, [Entry.FileName, Entry.OriginalSize, TempStream.Size]);
+
+          // Check CRC
+          TempStream.Position := 0;
+          CRC := TCRC32.Create;
+          try
+            CRC.Update(TempStream, TempStream.Size);
+            ComputedCRC := CRC.GetDigest;
+          finally
+            CRC.Free;
+          end;
+
+          if ComputedCRC = Entry.CRC32 then
+            WriteLn('✓ OK')
+          else
+            WriteLn(Format('✗ CRC MISMATCH (expected %08X, got %08X)', [Entry.CRC32, ComputedCRC]));
         finally
-          CRC.Free;
+          TempStream.Free;
+          if System.SysUtils.FileExists(TempFileName) then
+            System.SysUtils.DeleteFile(TempFileName);
         end;
-
-        if ComputedCRC = Entry.CRC32 then
-          WriteLn('✓ OK')
-        else
-          WriteLn(Format('✗ CRC MISMATCH (expected %08X, got %08X)', [Entry.CRC32, ComputedCRC]));
-
-        // Free ExtractedData before next iteration
-        FreeAndNil(ExtractedData);
 
       except
         on E: Exception do
         begin
           WriteLn('✗ ERROR: ' + E.Message);
-          FreeAndNil(ExtractedData);
         end;
       end;
     end;
@@ -1177,11 +1217,10 @@ begin
   finally
     ArchiveStream.Free;
     CompressedData.Free;
-    ExtractedData.Free;
   end;
 end;
 
-function TSMARTLARKArchive.DecompressFileEntry(Entry: TArchiveFileEntry; CompressedData: TMemoryStream): TMemoryStream;
+procedure TSMARTLARKArchive.DecompressFileEntryToStream(Entry: TArchiveFileEntry; CompressedData: TMemoryStream; OutputStream: TStream);
 var
   Codec: TLZHUFCodec;
   StoreCodec: TStoreCompressor;
@@ -1189,8 +1228,9 @@ var
   LZSSCompressor: TLZSSCompressor;
   LZWCompressor: TLZWCompressor;
   LZ77Compressor: TLZ77Compressor;
+  BoundedOutput: TBoundedStream;
 begin
-  Result := TMemoryStream.Create;
+  BoundedOutput := TBoundedStream.Create(OutputStream, Entry.OriginalSize);
   try
     CompressedData.Position := 0;
     case Entry.CompressionMethod of
@@ -1199,7 +1239,7 @@ begin
         // Store: no compression, just copy
         StoreCodec := TStoreCompressor.Create;
         try
-          StoreCodec.Decompress(CompressedData, Result);
+          StoreCodec.Decompress(CompressedData, BoundedOutput);
         finally
           StoreCodec.Free;
         end;
@@ -1209,7 +1249,7 @@ begin
         // LZSS: Lempel-Ziv-Storer-Szymanski (no Huffman)
         LZSSCompressor := TLZSSCompressor.Create;
         try
-          LZSSCompressor.Decompress(CompressedData, Result);
+          LZSSCompressor.Decompress(CompressedData, BoundedOutput);
         finally
           LZSSCompressor.Free;
         end;
@@ -1219,7 +1259,7 @@ begin
         // LZHUF: LZSS + Huffman
         Codec := TLZHUFCodec.Create;
         try
-          Codec.Decompress(CompressedData, Result);
+          Codec.Decompress(CompressedData, BoundedOutput);
         finally
           Codec.Free;
         end;
@@ -1229,7 +1269,7 @@ begin
         // DEFLATE: LZ77 + Huffman (zlib)
         DeflateCodec := TDeflateCompressor.Create;
         try
-          DeflateCodec.Decompress(CompressedData, Result);
+          DeflateCodec.Decompress(CompressedData, BoundedOutput);
         finally
           DeflateCodec.Free;
         end;
@@ -1239,7 +1279,7 @@ begin
         // LZW: Lempel-Ziv-Welch (UNIX compress)
         LZWCompressor := TLZWCompressor.Create;
         try
-          LZWCompressor.Decompress(CompressedData, Result);
+          LZWCompressor.Decompress(CompressedData, BoundedOutput);
         finally
           LZWCompressor.Free;
         end;
@@ -1249,12 +1289,26 @@ begin
         // LZ77: Classic Lempel-Ziv 1977
         LZ77Compressor := TLZ77Compressor.Create;
         try
-          LZ77Compressor.Decompress(CompressedData, Result);
+          LZ77Compressor.Decompress(CompressedData, BoundedOutput);
         finally
           LZ77Compressor.Free;
         end;
       end;
     end;
+  finally
+    BoundedOutput.Free;
+  end;
+end;
+
+function TSMARTLARKArchive.DecompressFileEntry(Entry: TArchiveFileEntry; CompressedData: TMemoryStream): TMemoryStream;
+begin
+  Result := TMemoryStream.Create;
+  try
+    DecompressFileEntryToStream(Entry, CompressedData, Result);
+    if Result.Size <> Entry.OriginalSize then
+      raise ESMARTLARKFormatException.CreateFmt(
+        'Decompressed size mismatch for file: %s (expected %d bytes, got %d). The archive may be corrupted.',
+        ecInvalidSizes, [Entry.FileName, Entry.OriginalSize, Result.Size]);
     Result.Position := 0;
   except
     Result.Free;

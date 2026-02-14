@@ -5,7 +5,7 @@ interface
 uses
   System.SysUtils, System.Classes, System.Generics.Collections, System.IOUtils,
   System.DateUtils, System.Math, Winapi.Windows,
-  uSMARTLARKArchive, uSMARTLARKTypes, uSMARTLARKExceptions;
+  uSMARTLARKArchive, uSMARTLARKTypes, uSMARTLARKExceptions, uOperationStats;
 
 type
   /// <summary>
@@ -69,6 +69,7 @@ type
     // Statistics
     procedure ShowOperationStart(const Operation: string);
     procedure ShowOperationEnd(const Operation: string; Success: Boolean);
+    procedure ShowTimingStats(const Operation: string; Stats: TOperationStats);
     function FormatDuration(Milliseconds: Int64): string;
     function FormatSpeed(Bytes: Int64; Milliseconds: Int64): string;
 
@@ -382,6 +383,16 @@ begin
   end;
 end;
 
+procedure TCommandLine.ShowTimingStats(const Operation: string; Stats: TOperationStats);
+begin
+  WriteLn('=== Operation Timing ===');
+  WriteLn(Format('Operation: %s', [Operation]));
+  WriteLn(Format('Time elapsed: %s', [Stats.FormatElapsedSeconds]));
+  WriteLn(Format('Processed bytes: %d', [Stats.BytesProcessed]));
+  WriteLn(Format('Speed: %s', [Stats.FormatBytesPerSecond]));
+  WriteLn('');
+end;
+
 function TCommandLine.FormatDuration(Milliseconds: Int64): string;
 var
   Seconds, Minutes, Hours: Int64;
@@ -431,16 +442,15 @@ var
   I: Integer;
   Path, Pattern: string;
   FileSize: Int64;
-  StartTime, EndTime: TDateTime;
-  ElapsedMs: Int64;
-  TotalBytes: Int64;
+  Stats: TOperationStats;
 begin
   Result := 0;
   FilesAdded := 0;
-  TotalBytes := 0;
+  Stats := TOperationStats.Create;
   OriginalFileList := TList<string>.Create;
 
   try
+    Stats.Start;
     // Save original file list for statistics
     for I := 0 to FFileList.Count - 1 do
       OriginalFileList.Add(FFileList[I]);
@@ -468,7 +478,6 @@ begin
     end;
 
     ShowOperationStart('Adding files to archive');
-    StartTime := Now;
 
     try
       Archive := TSMARTLARKArchive.Create;
@@ -501,18 +510,20 @@ begin
               
               Archive.AddFile(FileName, GetArchiveName(FileName));
               Inc(FilesAdded);
-              Inc(TotalBytes, FileSize);
+              Inc(Stats.BytesProcessed, FileSize);
             end
             else
             begin
               WriteLn('Error: File not found - ' + FileName);
               Result := 1;
+              Inc(Stats.Errors);
             end;
           except
             on E: Exception do
             begin
               WriteLn('Error adding file ' + FileName + ': ' + E.Message);
               Result := 1;
+              Inc(Stats.Errors);
             end;
           end;
         end;
@@ -520,8 +531,7 @@ begin
         if FilesAdded > 0 then
         begin
           Archive.SaveArchive;
-          EndTime := Now;
-          ElapsedMs := MilliSecondsBetween(EndTime, StartTime);
+          Stats.FilesProcessed := FilesAdded;
           
           if FVerbose then
           begin
@@ -529,13 +539,6 @@ begin
             WriteLn(Format('Archive saved: %s', [FArchiveFile]));
             WriteLn(Format('Files added: %d', [FilesAdded]));
             WriteLn(Format('Archive size: %s', [FormatBytes(GetFileSize(FArchiveFile))]));
-            WriteLn('');
-            WriteLn('=== Operation Statistics ===');
-            WriteLn(Format('Time elapsed: %s', [FormatDuration(ElapsedMs)]));
-            if TotalBytes > 0 then
-              WriteLn(Format('Total processed: %s', [FormatBytes(TotalBytes)]));
-            if ElapsedMs > 0 then
-              WriteLn(Format('Average speed: %s', [FormatSpeed(TotalBytes, ElapsedMs)]));
           end
           else
             WriteLn(Format('Added %d files to %s', [FilesAdded, FArchiveFile]));
@@ -549,12 +552,16 @@ begin
       begin
         WriteLn('Error: ' + E.Message);
         Result := 1;
+        Inc(Stats.Errors);
       end;
     end;
 
     ShowOperationEnd('Add', Result = 0);
 
   finally
+    Stats.Stop;
+    ShowTimingStats('Add', Stats);
+    Stats.Free;
     OriginalFileList.Free;
   end;
 end;
@@ -569,38 +576,46 @@ var
   Entry: TArchiveFileEntry;
   HasWildcards: Boolean;
   Matched: Boolean;
+  Stats: TOperationStats;
 begin
   Result := 0;
   FilesExtracted := 0;
-
-  if not System.SysUtils.FileExists(FArchiveFile) then
-  begin
-    WriteLn('Error: Archive file not found - ' + FArchiveFile);
-    Exit(1);
-  end;
-
-  if FOutputDir = '' then
-    OutputPath := '.'
-  else
-    OutputPath := FOutputDir;
-
-  // Create output directory if it doesn't exist
-  if not TDirectory.Exists(OutputPath) then
-  begin
-    try
-      TDirectory.CreateDirectory(OutputPath);
-    except
-      WriteLn('Error: Cannot create output directory - ' + OutputPath);
-      Exit(1);
-    end;
-  end;
-
-  ShowOperationStart('Extracting files');
-
+  Stats := TOperationStats.Create;
   try
-    Archive := TSMARTLARKArchive.Create;
+    Stats.Start;
+
+    if not System.SysUtils.FileExists(FArchiveFile) then
+    begin
+      WriteLn('Error: Archive file not found - ' + FArchiveFile);
+      Result := 1;
+      Inc(Stats.Errors);
+      Exit;
+    end;
+
+    if FOutputDir = '' then
+      OutputPath := '.'
+    else
+      OutputPath := FOutputDir;
+
+    // Create output directory if it doesn't exist
+    if not TDirectory.Exists(OutputPath) then
+    begin
+      try
+        TDirectory.CreateDirectory(OutputPath);
+      except
+        WriteLn('Error: Cannot create output directory - ' + OutputPath);
+        Result := 1;
+        Inc(Stats.Errors);
+        Exit;
+      end;
+    end;
+
+    ShowOperationStart('Extracting files');
+
     try
-      Archive.OpenArchive(FArchiveFile);
+      Archive := TSMARTLARKArchive.Create;
+      try
+        Archive.OpenArchive(FArchiveFile);
 
       if FVerbose then
         WriteLn(Format('Archive: %s (%d files)', [FArchiveFile, Archive.GetFileCount]));
@@ -637,6 +652,7 @@ begin
             Archive.ExtractFile(Entry.FileName,
               IncludeTrailingPathDelimiter(OutputPath) + ExtractFileName(Entry.FileName));
             Inc(FilesExtracted);
+            Inc(Stats.BytesProcessed, Entry.OriginalSize);
           except
             on E: Exception do
             begin
@@ -644,6 +660,7 @@ begin
                 WriteLn('');
               WriteLn('Error extracting file: ' + E.Message);
               Result := 1;
+              Inc(Stats.Errors);
             end;
           end;
         end;
@@ -684,6 +701,7 @@ begin
                 Archive.ExtractFile(Entry.FileName,
                   OutputPath + '\' + ExtractFileName(Entry.FileName));
                 Inc(FilesExtracted);
+                Inc(Stats.BytesProcessed, Entry.OriginalSize);
               except
                 on E: Exception do
                 begin
@@ -691,6 +709,7 @@ begin
                     WriteLn('');
                   WriteLn('Error extracting file ' + Entry.FileName + ': ' + E.Message);
                   Result := 1;
+                  Inc(Stats.Errors);
                 end;
               end;
             end;
@@ -707,62 +726,95 @@ begin
             try
               if FVerbose then
                 WriteLn('Extracting: ' + FileName);
+              Entry := Archive.GetFileInfo(FileName);
               Archive.ExtractFile(FileName, IncludeTrailingPathDelimiter(OutputPath) + ExtractFileName(FileName));
               Inc(FilesExtracted);
+              if Assigned(Entry) then
+                Inc(Stats.BytesProcessed, Entry.OriginalSize);
             except
               on E: Exception do
               begin
                 WriteLn('Error extracting file ' + FileName + ': ' + E.Message);
                 Result := 1;
+                Inc(Stats.Errors);
               end;
             end;
           end;
         end;
       end;
 
+      Stats.FilesProcessed := FilesExtracted;
+
       if FVerbose or (FilesExtracted > 0) then
         WriteLn(Format('Extracted %d files to %s', [FilesExtracted, OutputPath]));
 
-    finally
-      Archive.Free;
+      finally
+        Archive.Free;
+      end;
+    except
+      on E: Exception do
+      begin
+        WriteLn('Error: ' + E.Message);
+        Result := 1;
+        Inc(Stats.Errors);
+      end;
     end;
-  except
-    on E: Exception do
-    begin
-      WriteLn('Error: ' + E.Message);
-      Result := 1;
-    end;
-  end;
 
-  ShowOperationEnd('Extract', Result = 0);
+    ShowOperationEnd('Extract', Result = 0);
+  finally
+    Stats.Stop;
+    ShowTimingStats('Extract', Stats);
+    Stats.Free;
+  end;
 end;
 
 function TCommandLine.ExecuteList: Integer;
 var
   Archive: TSMARTLARKArchive;
+  I: Integer;
+  Entry: TArchiveFileEntry;
+  Stats: TOperationStats;
 begin
   Result := 0;
-
-  if not System.SysUtils.FileExists(FArchiveFile) then
-  begin
-    WriteLn('Error: Archive file not found - ' + FArchiveFile);
-    Exit(1);
-  end;
+  Stats := TOperationStats.Create;
 
   try
-    Archive := TSMARTLARKArchive.Create;
-    try
-      Archive.OpenArchive(FArchiveFile);
-      Archive.ListFiles;
-    finally
-      Archive.Free;
-    end;
-  except
-    on E: Exception do
+    Stats.Start;
+
+    if not System.SysUtils.FileExists(FArchiveFile) then
     begin
-      WriteLn('Error: ' + E.Message);
+      WriteLn('Error: Archive file not found - ' + FArchiveFile);
       Result := 1;
+      Inc(Stats.Errors);
+      Exit;
     end;
+
+    try
+      Archive := TSMARTLARKArchive.Create;
+      try
+        Archive.OpenArchive(FArchiveFile);
+        for I := 0 to Archive.GetFileCount - 1 do
+        begin
+          Entry := Archive.FileEntries[I];
+          Inc(Stats.BytesProcessed, Entry.OriginalSize);
+        end;
+        Stats.FilesProcessed := Archive.GetFileCount;
+        Archive.ListFiles;
+      finally
+        Archive.Free;
+      end;
+    except
+      on E: Exception do
+      begin
+        WriteLn('Error: ' + E.Message);
+        Result := 1;
+        Inc(Stats.Errors);
+      end;
+    end;
+  finally
+    Stats.Stop;
+    ShowTimingStats('List', Stats);
+    Stats.Free;
   end;
 end;
 
@@ -776,16 +828,22 @@ var
   HasWildcards: Boolean;
   Matched: Boolean;
   FilesToDelete: TList<string>;
+  Stats: TOperationStats;
 begin
   Result := 0;
   FilesDeleted := 0;
   FilesToDelete := TList<string>.Create;
+  Stats := TOperationStats.Create;
 
   try
+    Stats.Start;
+
     if not System.SysUtils.FileExists(FArchiveFile) then
     begin
       WriteLn('Error: Archive file not found - ' + FArchiveFile);
-      Exit(1);
+      Result := 1;
+      Inc(Stats.Errors);
+      Exit;
     end;
 
     // Check if any pattern contains wildcards
@@ -842,10 +900,12 @@ begin
             if FVerbose then
               WriteLn('Deleting: ' + FileName);
 
-            if Archive.FileExists(FileName) then
+            Entry := Archive.GetFileInfo(FileName);
+            if Assigned(Entry) then
             begin
               Archive.DeleteFile(FileName);
               Inc(FilesDeleted);
+              Inc(Stats.BytesProcessed, Entry.OriginalSize);
             end
             else
             begin
@@ -856,6 +916,7 @@ begin
             begin
               WriteLn('Error deleting file ' + FileName + ': ' + E.Message);
               Result := 1;
+              Inc(Stats.Errors);
             end;
           end;
         end;
@@ -866,6 +927,8 @@ begin
           WriteLn(Format('Deleted %d files from archive', [FilesDeleted]));
         end;
 
+        Stats.FilesProcessed := FilesDeleted;
+
       finally
         Archive.Free;
       end;
@@ -874,48 +937,72 @@ begin
       begin
         WriteLn('Error: ' + E.Message);
         Result := 1;
+        Inc(Stats.Errors);
       end;
     end;
+    ShowOperationEnd('Delete', Result = 0);
   finally
+    Stats.Stop;
+    ShowTimingStats('Delete', Stats);
+    Stats.Free;
     FilesToDelete.Free;
   end;
-
-  ShowOperationEnd('Delete', Result = 0);
 end;
 
 function TCommandLine.ExecuteTest: Integer;
 var
   Archive: TSMARTLARKArchive;
+  I: Integer;
+  Entry: TArchiveFileEntry;
+  Stats: TOperationStats;
 begin
   Result := 0;
-
-  if not System.SysUtils.FileExists(FArchiveFile) then
-  begin
-    WriteLn('Error: Archive file not found - ' + FArchiveFile);
-    Exit(1);
-  end;
-
-  ShowOperationStart('Testing archive');
+  Stats := TOperationStats.Create;
 
   try
-    Archive := TSMARTLARKArchive.Create;
-    try
-      Archive.OpenArchive(FArchiveFile);
-      Archive.TestIntegrity;
-      WriteLn('');
-      WriteLn('Archive test passed successfully.');
-    finally
-      Archive.Free;
-    end;
-  except
-    on E: Exception do
-    begin
-      WriteLn('Error: ' + E.Message);
-      Result := 1;
-    end;
-  end;
+    Stats.Start;
 
-  ShowOperationEnd('Test', Result = 0);
+    if not System.SysUtils.FileExists(FArchiveFile) then
+    begin
+      WriteLn('Error: Archive file not found - ' + FArchiveFile);
+      Result := 1;
+      Inc(Stats.Errors);
+      Exit;
+    end;
+
+    ShowOperationStart('Testing archive');
+
+    try
+      Archive := TSMARTLARKArchive.Create;
+      try
+        Archive.OpenArchive(FArchiveFile);
+        for I := 0 to Archive.GetFileCount - 1 do
+        begin
+          Entry := Archive.FileEntries[I];
+          Inc(Stats.BytesProcessed, Entry.OriginalSize);
+        end;
+        Stats.FilesProcessed := Archive.GetFileCount;
+        Archive.TestIntegrity;
+        WriteLn('');
+        WriteLn('Archive test passed successfully.');
+      finally
+        Archive.Free;
+      end;
+    except
+      on E: Exception do
+      begin
+        WriteLn('Error: ' + E.Message);
+        Result := 1;
+        Inc(Stats.Errors);
+      end;
+    end;
+
+    ShowOperationEnd('Test', Result = 0);
+  finally
+    Stats.Stop;
+    ShowTimingStats('Test', Stats);
+    Stats.Free;
+  end;
 end;
 
 function TCommandLine.ExecuteUpdate: Integer;

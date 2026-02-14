@@ -3,7 +3,7 @@ unit uLZWCompressor;
 interface
 
 uses
-  System.SysUtils, System.Classes, System.Generics.Collections;
+  System.SysUtils, System.Classes, System.Generics.Collections, uSMARTLARKExceptions;
 
 type
   // LZW Compressor (UNIX compress algorithm)
@@ -205,7 +205,7 @@ begin
     
   except
     on E: Exception do
-      raise Exception.Create('LZW compression failed: ' + E.Message);
+      raise ESMARTLARKCompressionException.Create('LZW compression failed: ' + E.Message);
   end;
 end;
 
@@ -387,7 +387,7 @@ begin
     
   except
     on E: Exception do
-      raise Exception.Create('LZW decompression failed: ' + E.Message);
+      raise ESMARTLARKCompressionException.Create('LZW decompression failed: ' + E.Message);
   end;
 end;
 
